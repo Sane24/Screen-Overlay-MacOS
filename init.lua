@@ -2,24 +2,27 @@
 --
 -- MORNING   First time the laptop is open and unlocked after 7am: full screen with a collage
 --           of pics, a tip, today's calendar, and your plan. Confirm it, edit it, or plan the day.
--- PLANNING  Up to 5 tasks, each with a start time and a length ("10:30am CS160 PRD 45m").
+-- PLANNING  Up to 5 tasks, each with a start time and a length ("4pm Study GRE 3h").
 --           Tasks also go to Structured as timed blocks (if that shortcut exists).
 -- TASKS     30 min before: spoken heads-up. At start time the screen gets covered:
 --             Enter = type the first step, then the 25 min Clock timer (+ Structured focus timer)
 --             S     = not now. You get one of your tips and 8 seconds to think. Then:
 --                     Enter = just 2 minutes.  B = busy / out: type why, then pick how long.
 --                     After 3 pushes it can only be started, moved to tomorrow, or dropped.
+-- BLOCK END When the length you planned is up (counted from when you started), it checks in:
+--             D = done (celebration with your pics)   G = still going (+30 min)   N = next step
 -- NIGHT     At midnight: close out the day. Each open task: done, tomorrow (pick a time), or drop.
 --           Then plan tomorrow if you want. Missed it? It shows the next time you open the laptop.
--- PICS      Overlays show pics from M.imageFolder. Left / Right arrows flip through more.
+-- PICS      Overlays show pics from M.imageFolder, never cropped. Left / Right arrows flip through more.
 --           Typing boxes get a dark screen with the time and a row of pics behind them.
--- QUIET     10pm to 7am: no task reminders or heads-ups. The night review and morning still show.
+-- QUIET     10pm to 7am: no task reminders, heads-ups or block check-ins.
+--           The night review and morning still show.
 --
 -- Hotkeys (ctrl+alt+cmd + key)
 --   N  plan today              shift+N  plan tomorrow
 --   T  check-in now            O  morning screen now        R  close out today now
 --   P  pause everything until tomorrow morning (press again to resume)
---   M  mute / unmute the spoken heads-up
+--   M  mute / unmute sounds (heads-up voice, celebration sound)
 --
 -- Shortcuts this uses (Shortcuts app). Only "Focus 25" is needed; the rest are optional.
 --   "Focus 25"                  Start Timer, 25 minutes
@@ -35,6 +38,7 @@ local M = DayPlan
 -- ===== settings =====
 M.maxTasks          = 5                  -- tasks per day
 M.defaultMinutes    = 30                 -- task length if you don't give one
+M.extendMinutes     = 30                 -- "still going" / "next step" checks back after this long
 M.morningHour       = 7                  -- morning screen: first unlock at or after this hour
 M.reviewHour        = 0                  -- night review: 0 = midnight
 M.dayStartHour      = 4                  -- a "day" runs 4am to 4am, so midnight still counts as today
@@ -49,6 +53,8 @@ M.planPromptHour    = 8                  -- still no plan after this hour: ask a
 M.snoozes           = { 15, 30, 60 }     -- quick push buttons, in minutes
 M.promptPics        = 4                  -- pics behind typing boxes
 M.collagePics       = 4                  -- pics in the morning / night collage
+M.celebratePics     = 6                  -- pics on the celebration screen
+M.celebrateSound    = "Hero"             -- any name from /System/Library/Sounds (nil = none)
 M.timerShortcut           = "Focus 25"
 M.structuredAddShortcut   = "DayPlan to Structured"
 M.structuredFocusShortcut = "DayPlan Structured Focus"
@@ -57,6 +63,26 @@ M.file        = os.getenv("HOME") .. "/.hammerspoon/dayplan.json"
 M.oldFile     = os.getenv("HOME") .. "/.hammerspoon/today.json"
 M.agendaFile  = os.getenv("HOME") .. "/.hammerspoon/agenda.txt"
 M.imageFolder = os.getenv("HOME") .. "/Desktop/crushing"   -- motivation pics (nil = off)
+
+-- Look
+M.theme = {
+  bgTop    = { hex = "#1A1733", alpha = 0.98 },   -- background fades from this at the top...
+  bgBottom = { hex = "#0A0A12", alpha = 0.98 },   -- ...to this at the bottom
+  glow     = { hex = "#FFD166", alpha = 0.07 },   -- soft warm light behind the text
+  accent   = { hex = "#FFD166" },
+  onAccent = { hex = "#17140A" },
+  text     = { white = 0.96 },
+  dim      = { white = 0.66 },
+  faint    = { white = 0.44 },
+  panel    = { hex = "#0D0C18", alpha = 0.84 },
+  picRadius = 18,
+  fonts = {
+    clock = "Avenir Next Ultra Light",
+    title = "Avenir Next Demi Bold",
+    body  = "Avenir Next Medium",
+    small = "Avenir Next Regular",
+  },
+}
 
 -- Tips, from your playbook. Edit freely.
 M.startTips = {   -- shown on the "not now" screen
@@ -80,9 +106,17 @@ M.morningTips = { -- shown on the morning screen
   "Write the win condition before you start.",
   "Phone in another room for timed sets.",
 }
+M.celebrateLines = { -- shown when you finish something
+  "Crushing it.",
+  "That's proof you can.",
+  "Said you would. Did it.",
+  "Future you says thanks.",
+  "One less thing living in your head.",
+}
 -- ====================
 
 M.canvases       = {}
+M.canvasAreas    = {}
 M.modal          = nil
 M.mode           = nil
 M.pausedUntil    = nil
@@ -91,6 +125,7 @@ M.planNextAsk    = 0
 M.muted          = hs.settings.get("dayplan.muted") or false
 M.imgList        = {}
 M.imgPos         = 1
+M.imgEl          = {}
 M.slotCount      = 0
 M.hasImage       = false
 M.lineIndex      = {}
@@ -98,8 +133,7 @@ M.overlayId      = 0
 M.shortcutNames  = {}
 M.shortcutQueue  = {}
 
-local YELLOW = { hex = "#FFD166" }
-local DIM    = { white = 0.6 }
+local T      = M.theme
 local MARKS  = { pending = "○", started = "▶", done = "✓", dropped = "✗", moved = "→" }
 
 -- ---------- helpers ----------
@@ -128,6 +162,12 @@ end
 local function randomTip(list)
   if not list or #list == 0 then return "" end
   return list[math.random(#list)]
+end
+
+local function playSound(name)
+  if M.muted or not name then return end
+  local s = hs.sound.getByName(name)
+  if s then s:play() end
 end
 
 local function isQuiet(now)
@@ -261,8 +301,8 @@ local function taskListText(d, heading)
   if heading then table.insert(out, heading) end
   for _, t in ipairs(d.tasks) do
     local len = fmtLen(t.minutes)
-    table.insert(out, string.format("%s  %s   %s%s", MARKS[t.state] or "○", fmtTime(t.due), t.name,
-      (len ~= "") and ("  (" .. len .. ")") or ""))
+    table.insert(out, string.format("%s   %s    %s%s", MARKS[t.state] or "○", fmtTime(t.due), t.name,
+      (len ~= "") and ("   ·  " .. len) or ""))
   end
   return table.concat(out, "\n")
 end
@@ -270,7 +310,11 @@ end
 local function setState(date, idx, state)
   local s = loadStore()
   local t = dayOf(s, date).tasks[idx]
-  if t then t.state = state; saveStore(s) end
+  if t then
+    t.state = state
+    if state == "done" then t.doneAt = os.time() end
+    saveStore(s)
+  end
   return t
 end
 
@@ -459,12 +503,12 @@ local function agendaText(items, date, label)
   local out = {}
   for _, it in ipairs(items) do
     if it.date == date and #out < 8 then
-      if it.kind == "E" then table.insert(out, it.time .. "   " .. it.title)
-      else table.insert(out, "☐  " .. it.title) end
+      if it.kind == "E" then table.insert(out, it.time .. "    " .. it.title)
+      else table.insert(out, "☐   " .. it.title) end
     end
   end
   if #out == 0 then return label .. ": nothing on the calendar" end
-  return label .. "'s calendar\n" .. table.concat(out, "\n")
+  return label:upper() .. "'S CALENDAR\n" .. table.concat(out, "\n")
 end
 
 local function fetchAgenda(cb)
@@ -508,15 +552,103 @@ local function loadImage(path)
   return hs.image.imageFromPath(path)
 end
 
+local PIC_GAP = 14   -- points between pics
+
+-- width / height of a pic (and whether we could read its size)
+local function aspectOf(img)
+  local ok, sz = pcall(function() return img:size() end)
+  if ok and type(sz) == "table" and sz.w and sz.h and sz.w > 0 and sz.h > 0 then
+    return sz.w / sz.h, true
+  end
+  return 1, false
+end
+
+-- Lay pics out in `nrows` rows inside `area` at their real shape: nothing gets cropped.
+-- Each row spans the width; if that's too tall, everything shrinks to fit. Returns rects, area used.
+local function justify(aspects, area, gap, nrows)
+  local n, total = #aspects, 0
+  for _, a in ipairs(aspects) do total = total + a end
+  local target = total / nrows
+  local rows, cur, curSum = {}, {}, 0
+  for i, a in ipairs(aspects) do
+    table.insert(cur, i)
+    curSum = curSum + a
+    local rowsLeft, itemsLeft = nrows - #rows - 1, n - i
+    if rowsLeft > 0 and (curSum >= target * 0.95 or itemsLeft == rowsLeft) then
+      table.insert(rows, cur)
+      cur, curSum = {}, 0
+    end
+  end
+  if #cur > 0 then table.insert(rows, cur) end
+
+  local heights, sumH = {}, 0
+  for r, row in ipairs(rows) do
+    local sum = 0
+    for _, i in ipairs(row) do sum = sum + aspects[i] end
+    heights[r] = (area.w - gap * (#row - 1)) / sum
+    sumH = sumH + heights[r]
+  end
+  local scale = math.min(1, (area.h - gap * (#rows - 1)) / sumH)
+  local y = area.y + (area.h - (sumH * scale + gap * (#rows - 1))) / 2
+  local rects, used = {}, 0
+  for r, row in ipairs(rows) do
+    local h = heights[r] * scale
+    local rowW = gap * (#row - 1)
+    for _, i in ipairs(row) do rowW = rowW + aspects[i] * h end
+    local x = area.x + (area.w - rowW) / 2
+    for _, i in ipairs(row) do
+      local w = aspects[i] * h
+      rects[i] = { x = x, y = y, w = w, h = h }
+      used = used + w * h
+      x = x + w + gap
+    end
+    y = y + h + gap
+  end
+  return rects, used
+end
+
+-- try 1 to 4 rows, keep whichever shows the pics biggest
+local function fitPics(aspects, area, gap)
+  local best, bestUsed = {}, -1
+  for r = 1, math.min(#aspects, 4) do
+    local rects, used = justify(aspects, area, gap, r)
+    if used > bestUsed then best, bestUsed = rects, used end
+  end
+  return best
+end
+
+-- rounded pic exactly the size of rect r: 3 canvas elements (clip, image, reset). The image is the 2nd.
+local function picElements(img, r, known)
+  return
+    { type = "rectangle", action = "clip", frame = r,
+      roundedRectRadii = { xRadius = T.picRadius, yRadius = T.picRadius } },
+    { type = "image", image = img, frame = r, imageAlignment = "center",
+      imageScaling = known and "scaleToFit" or "scaleProportionally" },
+    { type = "resetClip" }
+end
+
+-- dark gradient + warm glow: 2 canvas elements
+local function backgroundElements()
+  return
+    { type = "rectangle", action = "fill", fillGradient = "linear",
+      fillGradientColors = { T.bgBottom, T.bgTop }, fillGradientAngle = 90 },
+    { type = "rectangle", action = "fill", fillGradient = "radial",
+      fillGradientColors = { T.glow, { hex = "#FFD166", alpha = 0 } },
+      fillGradientCenter = { x = 0.35, y = 0.45 } }
+end
+local BG_COUNT = 2
+
 -- ---------- overlay ----------
 local function closeOverlay()
   for _, c in ipairs(M.canvases) do c:delete() end
   M.canvases = {}
+  M.canvasAreas = {}
   if M.modal then M.modal:exit(); M.modal = nil end
   if M.waitTimer then M.waitTimer:stop(); M.waitTimer = nil end
   M.mode = nil
   M.hasImage = false
   M.slotCount = 0
+  M.imgEl = {}
   M.lineIndex = {}
 end
 
@@ -526,20 +658,54 @@ end
 
 local function pct(n) return string.format("%.2f%%", n) end
 
-local function imageHint()
-  if #M.imgList <= M.slotCount then return "" end
-  if M.slotCount == 1 then return string.format("←  →     %d / %d", M.imgPos, #M.imgList) end
-  return "←  →   more pics"
+local KEY_GLYPH = { ["return"] = "⏎", escape = "esc" }
+local function keyHint(b)
+  local k = b.keys and b.keys[1]
+  if not k then return "" end
+  return KEY_GLYPH[k] or k:upper()
 end
 
--- left/right arrows: next or previous pic (or set of pics in a collage)
+local function imageHint()
+  if #M.imgList <= M.slotCount then return "" end
+  if M.slotCount == 1 then return string.format("←  →      %d / %d", M.imgPos, #M.imgList) end
+  return "←  →     more pics"
+end
+
+-- where the pics go, in % of the screen, and how many
+local PIC_AREAS = {
+  side    = { x = 3, y = 5, w = 46, h = 88 },   -- one pic, text on the right
+  collage = { x = 3, y = 5, w = 46, h = 88 },   -- a few pics, text on the right
+  gallery = { x = 3, y = 4, w = 60, h = 90 },   -- celebration: lots of pics, text on the right
+}
+local function picCount(layout)
+  if layout == "collage" then return M.collagePics end
+  if layout == "gallery" then return M.celebratePics end
+  return 1
+end
+
+local function absRect(p, fr)
+  return { x = fr.w * p.x / 100, y = fr.h * p.y / 100, w = fr.w * p.w / 100, h = fr.h * p.h / 100 }
+end
+
+-- left/right arrows: next or previous pic (or set of pics)
 local function flipImage(step)
   if not M.hasImage or #M.imgList <= M.slotCount then return end
   M.imgPos = (M.imgPos - 1 + step * M.slotCount) % #M.imgList + 1
+  local imgs, aspects, known = {}, {}, {}
   for j = 1, M.slotCount do
     local img = loadImage(M.imgList[(M.imgPos - 1 + j - 1) % #M.imgList + 1])
-    if img then
-      for _, c in ipairs(M.canvases) do c[1 + j].image = img end
+    if not img then return end
+    imgs[j] = img
+    aspects[j], known[j] = aspectOf(img)
+  end
+  for ci, c in ipairs(M.canvases) do
+    local rects = fitPics(aspects, M.canvasAreas[ci], PIC_GAP)
+    for j = 1, M.slotCount do
+      c[M.imgEl[j] - 1].frame = rects[j]
+      local el = c[M.imgEl[j]]
+      el.image = imgs[j]
+      el.frame = rects[j]
+      el.imageScaling = known[j] and "scaleToFit" or "scaleProportionally"
     end
   end
   M.lastImage = M.imgList[M.imgPos]
@@ -552,9 +718,18 @@ function M.setLine(key, text)
   for _, c in ipairs(M.canvases) do c[idx].text = text end
 end
 
--- lines:   { { text=, size=, color=, y=, h=, key= }, ... }   y and h are percents of the screen
--- buttons: { { label=, keys={...}, fn=, primary=, hidden= }, ... }   hidden = key only, no button
--- opts:    wait = seconds keys/clicks stay locked,  collage = 2x2 grid of pics instead of one
+function M.lineText(key)
+  local idx = M.lineIndex[key]
+  return idx and M.canvases[1] and M.canvases[1][idx].text
+end
+
+-- lines:   { { text=, size=, color=, font=, y=, h=, key= }, ... }  y, h in % of the screen
+--          font: "clock", "title", "body" (default) or "small"
+-- buttons: { { label=, keys={...}, fn=, primary=, hidden= }, ... }  hidden = key only, no button
+-- opts:    wait = seconds keys/clicks stay locked
+--          layout = "side" (one pic on the left, default), "collage" (a few pics on the left),
+--                   "gallery" (lots of pics on the left 60%, for the celebration)
+--          Pics keep their real shape. They're arranged in rows to be as big as fits.
 local function showOverlay(mode, lines, buttons, opts)
   opts = opts or {}
   closeOverlay()
@@ -572,82 +747,85 @@ local function showOverlay(mode, lines, buttons, opts)
   M.modal:bind({}, "left", function() flipImage(-1) end)
   M.modal:bind({}, "right", function() flipImage(1) end)
 
-  -- pics on the left 40%
+  -- pics
+  local layout = PIC_AREAS[opts.layout] and opts.layout or "side"
   M.imgList, M.imgPos = listImages(), 1
-  local frames = {}
-  if #M.imgList > 0 then
-    if opts.collage then
-      local n = math.min(M.collagePics, #M.imgList)
-      local cols = (n == 1) and 1 or 2
-      local rows = math.ceil(n / cols)
-      local gap = 1.2
-      local w = (38 - (cols - 1) * gap) / cols
-      local h = (87 - (rows - 1) * gap) / rows
-      for i = 1, n do
-        local r, col = (i - 1) // cols, (i - 1) % cols
-        frames[i] = { x = 3 + col * (w + gap), y = 6 + r * (h + gap), w = w, h = h }
-      end
-    else
-      frames[1] = { x = 3, y = 6, w = 38, h = 87 }
-    end
-  end
   local imgs = {}
-  for i = 1, #frames do imgs[i] = loadImage(M.imgList[i]) end
-  if #frames > 0 and not imgs[1] then frames = {} end
-  for i = 2, #frames do imgs[i] = imgs[i] or imgs[1] end
-  M.slotCount = #frames
-  M.hasImage = (#frames > 0)
+  for i = 1, math.min(picCount(layout), #M.imgList) do
+    local img = loadImage(M.imgList[i])
+    if img then table.insert(imgs, img) end
+  end
+  M.slotCount = #imgs
+  M.hasImage = (#imgs > 0)
   if M.hasImage then M.lastImage = M.imgList[1] end
-  M.hintIndex = 2 + #frames
+  local aspects, known = {}, {}
+  for j, img in ipairs(imgs) do aspects[j], known[j] = aspectOf(img) end
 
+  -- element numbering (same on every screen)
+  local count = BG_COUNT
+  M.imgEl = {}
+  for j = 1, #imgs do M.imgEl[j] = count + 2; count = count + 3 end
+  M.hintIndex = count + 1
+  count = count + 1
+  M.lineIndex = {}
+  for i, l in ipairs(lines) do
+    if l.key then M.lineIndex[l.key] = count + i end
+  end
+
+  -- text column
   local cx, cw = 6, 88
-  if M.hasImage then cx, cw = 44, 52 end
+  if M.hasImage then
+    if layout == "gallery" then cx, cw = 66, 31 else cx, cw = 52, 45 end
+  end
+  local areaP = PIC_AREAS[layout]
 
   local visible = {}
   for _, b in ipairs(buttons) do if not b.hidden then table.insert(visible, b) end end
-  local gap = 1.5
+  local gap = 1.4
   local nb = math.max(#visible, 1)
-  local bw = math.min(20, (cw - (nb - 1) * gap) / nb)
+  local bw = math.min(19, (cw - (nb - 1) * gap) / nb)
   local x0 = cx + (cw - (#visible * bw + (#visible - 1) * gap)) / 2
-  local btnText = (bw < 9) and 13 or ((bw < 11) and 15 or ((bw < 15) and 18 or 22))
-
-  M.lineIndex = {}
-  for i, l in ipairs(lines) do
-    if l.key then M.lineIndex[l.key] = M.hintIndex + i end
-  end
+  local btnText = (bw < 9) and 13 or ((bw < 11) and 15 or ((bw < 15) and 17 or 20))
 
   for _, screen in ipairs(hs.screen.allScreens()) do
-    local c = hs.canvas.new(screen:fullFrame())
+    local fr = screen:fullFrame()
+    local c = hs.canvas.new(fr)
     c:level(hs.canvas.windowLevels.screenSaver)
     c:behaviorAsLabels({ "canJoinAllSpaces", "stationary", "fullScreenAuxiliary" })
-    c:appendElements({ type = "rectangle", action = "fill",
-      fillColor = { hex = "#0E0E12", alpha = 0.97 } })
+    c:appendElements(backgroundElements())
 
-    for i, f in ipairs(frames) do
-      c:appendElements({ type = "image", image = imgs[i], imageScaling = "scaleProportionally",
-        imageAlignment = "center", frame = { x = pct(f.x), y = pct(f.y), w = pct(f.w), h = pct(f.h) } })
-    end
-    c:appendElements({ type = "text", text = M.hasImage and imageHint() or "", textSize = 16,
-      textColor = DIM, textAlignment = "center", frame = { x = "3%", y = "94%", w = "38%", h = "4%" } })
+    local area = absRect(areaP, fr)
+    local rects = fitPics(aspects, area, PIC_GAP)
+    for j, img in ipairs(imgs) do c:appendElements(picElements(img, rects[j], known[j])) end
+    table.insert(M.canvasAreas, area)
+
+    c:appendElements({ type = "text", text = M.hasImage and imageHint() or "", textFont = T.fonts.small,
+      textSize = 15, textColor = T.faint, textAlignment = "center",
+      frame = { x = pct(areaP.x), y = pct(areaP.y + areaP.h + 1.2), w = pct(areaP.w), h = "3.5%" } })
 
     for _, l in ipairs(lines) do
       c:appendElements({ type = "text", text = l.text or "", textSize = l.size,
-        textColor = l.color or { white = 1 }, textAlignment = "center",
+        textFont = T.fonts[l.font or "body"] or T.fonts.body,
+        textColor = l.color or T.text, textAlignment = "center",
         frame = { x = pct(cx), y = pct(l.y), w = pct(cw), h = pct(l.h) } })
     end
 
+    local bh = math.floor(fr.h * 0.064)
+    local by = fr.h * 0.80
     for i, b in ipairs(visible) do
-      local x = x0 + (i - 1) * (bw + gap)
+      local bx = fr.w * (x0 + (i - 1) * (bw + gap)) / 100
+      local bwp = fr.w * bw / 100
       local id = "b" .. i
       c:appendElements(
-        { type = "rectangle", action = "fill", id = id, trackMouseDown = true,
-          roundedRectRadii = { xRadius = 14, yRadius = 14 },
-          fillColor = b.primary and YELLOW or { white = 1, alpha = 0.12 },
-          frame = { x = pct(x), y = "80%", w = pct(bw), h = "8%" } },
-        { type = "text", text = b.label, textSize = btnText, id = id, trackMouseDown = true,
-          textColor = b.primary and { hex = "#0E0E12" } or { white = 0.9 },
-          textAlignment = "center",
-          frame = { x = pct(x), y = "82.4%", w = pct(bw), h = "5%" } }
+        { type = "rectangle", action = b.primary and "fill" or "strokeAndFill", id = id, trackMouseDown = true,
+          roundedRectRadii = { xRadius = bh / 2, yRadius = bh / 2 },
+          fillColor = b.primary and T.accent or { white = 1, alpha = 0.07 },
+          strokeColor = { white = 1, alpha = 0.22 }, strokeWidth = 1,
+          frame = { x = bx, y = by, w = bwp, h = bh } },
+        { type = "text", text = b.label .. "    " .. keyHint(b), textFont = T.fonts.title,
+          textSize = btnText, id = id, trackMouseDown = true,
+          textColor = b.primary and T.onAccent or T.text, textAlignment = "center",
+          frame = { x = bx, y = by + (bh - btnText * 1.4) / 2, w = bwp, h = btnText * 1.6 } }
       )
     end
 
@@ -658,7 +836,7 @@ local function showOverlay(mode, lines, buttons, opts)
         M.clickTimer = hs.timer.doAfter(0.05, visible[i].fn)
       end
     end)
-    c:show()
+    c:show(0.25)
     table.insert(M.canvases, c)
   end
   M.modal:enter()
@@ -666,17 +844,17 @@ end
 
 -- counts down on the line with key "wait"
 local function startWaitCountdown(secs)
-  if secs <= 0 then M.setLine("wait", "Esc = back") return end
+  if secs <= 0 then M.setLine("wait", "esc = back") return end
   local id, left = M.overlayId, secs
-  M.setLine("wait", "Buttons unlock in " .. left .. "s")
+  M.setLine("wait", "unlocks in " .. left .. "s")
   M.waitTimer = hs.timer.doEvery(1, function()
     if M.overlayId ~= id then return end
     left = left - 1
     if left <= 0 then
-      M.setLine("wait", "Esc = back")
+      M.setLine("wait", "esc = back")
       if M.waitTimer then M.waitTimer:stop(); M.waitTimer = nil end
     else
-      M.setLine("wait", "Buttons unlock in " .. left .. "s")
+      M.setLine("wait", "unlocks in " .. left .. "s")
     end
   end)
 end
@@ -707,30 +885,27 @@ local function showBackdrop(title)
   end
 
   for _, screen in ipairs(hs.screen.allScreens()) do
-    local c = hs.canvas.new(screen:fullFrame())
+    local fr = screen:fullFrame()
+    local c = hs.canvas.new(fr)
     c:level(hs.canvas.windowLevels.normal)
     c:behaviorAsLabels({ "canJoinAllSpaces", "stationary", "fullScreenAuxiliary" })
+    c:appendElements(backgroundElements())
     c:appendElements(
-      { type = "rectangle", action = "fill", fillColor = { hex = "#0E0E12", alpha = 0.97 } },
-      { type = "text", text = fmtTime(os.time()), textSize = 96, textColor = { white = 1 },
-        textAlignment = "center", frame = { x = "0%", y = "4%", w = "100%", h = "13%" } },
-      { type = "text", text = title or "", textSize = 30, textColor = YELLOW,
+      { type = "text", text = fmtTime(os.time()), textFont = T.fonts.clock, textSize = 96,
+        textColor = T.text, textAlignment = "center", frame = { x = "0%", y = "4%", w = "100%", h = "13%" } },
+      { type = "text", text = title or "", textFont = T.fonts.body, textSize = 28, textColor = T.accent,
         textAlignment = "center", textLineBreak = "truncateTail",
         frame = { x = "6%", y = "18%", w = "88%", h = "6%" } }
     )
-    local n = #pics
-    if n > 0 then
-      local gap = 1.5
-      local w = (94 - (n - 1) * gap) / n
-      for i, img in ipairs(pics) do
-        c:appendElements({ type = "image", image = img, imageScaling = "scaleProportionally",
-          imageAlignment = "center",
-          frame = { x = pct(3 + (i - 1) * (w + gap)), y = "58%", w = pct(w), h = "37%" } })
-      end
+    if #pics > 0 then
+      local aspects, known = {}, {}
+      for j, img in ipairs(pics) do aspects[j], known[j] = aspectOf(img) end
+      local rects = fitPics(aspects, absRect({ x = 3, y = 56, w = 94, h = 40 }, fr), PIC_GAP)
+      for j, img in ipairs(pics) do c:appendElements(picElements(img, rects[j], known[j])) end
     end
     c:canvasMouseEvents(true, false, false, false)   -- swallow clicks
     c:mouseCallback(function() end)
-    c:show()
+    c:show(0.2)
     table.insert(M.canvases, c)
   end
 end
@@ -760,10 +935,38 @@ local function promptFirstStep(idx, small)
     if small then M.showNotNow(idx) else M.showTask(idx) end
     return
   end
-  t.step, t.state, t.startedAt = step, "started", os.time()
+  local now = os.time()
+  t.step, t.state, t.startedAt = step, "started", now
+  t.checkAt = now + (t.minutes or M.defaultMinutes) * 60   -- block-end check-in
   saveStore(s)
   startTimers(t.name)
   hs.alert.show("Go: " .. step, 3)
+end
+
+-- block end: "next step"
+local function promptNextStep(idx)
+  local s = loadStore()
+  local t = dayOf(s, today()).tasks[idx]
+  if not t then return end
+  local btn, step = hs.dialog.textPrompt("Next step for: " .. t.name,
+    "The smallest action you can start in 2 minutes.", "", "Start", "Back")
+  step = trim(step)
+  if btn ~= "Start" or step == "" then M.showBlockEnd(idx) return end
+  t.step = step
+  t.checkAt = os.time() + M.extendMinutes * 60
+  saveStore(s)
+  startTimers(t.name)
+  hs.alert.show("Go: " .. step .. "   ·   checking back at " .. fmtTime(t.checkAt), 4)
+end
+
+local function extendBlock(idx)
+  closeOverlay()
+  local s = loadStore()
+  local t = dayOf(s, today()).tasks[idx]
+  if not t then return end
+  t.checkAt = os.time() + M.extendMinutes * 60
+  saveStore(s)
+  hs.alert.show("Keep going. Checking back at " .. fmtTime(t.checkAt), 3)
 end
 
 local function snooze(idx, mins, reason)
@@ -846,15 +1049,17 @@ local function editStep()
   end
 end
 
-local function markDone()
+-- mark done, then celebrate
+local function finishTask(date, idx)
   closeOverlay()
-  local s = loadStore()
-  local d = dayOf(s, today())
-  local idx = activeIndex(d)
-  if not idx then return end
-  d.tasks[idx].state = "done"
-  saveStore(s)
-  hs.alert.show("Done: " .. d.tasks[idx].name, 3)
+  setState(date, idx, "done")
+  M.celebrate(date, idx)
+end
+
+local function markDone()
+  local idx = activeIndex(dayOf(loadStore(), today()))
+  if not idx then closeOverlay() return end
+  finishTask(today(), idx)
 end
 
 local function finishReview(date)
@@ -883,7 +1088,7 @@ function M.plan(date)
       (prev.minutes or M.defaultMinutes) .. "m") or ""
     local okLabel = (i < M.maxTasks) and "Next" or "Save"
     local btn, text = hs.dialog.textPrompt(string.format("Task %d of %d for %s", i, M.maxTasks, label),
-      'Time + task + length, like "10:30am CS160 PRD 45m" or "2pm LeetCode 1h".\n' ..
+      'Time + task + length, like "4pm Study GRE 3h" or "10:30am CS160 PRD 45m".\n' ..
       "Leave it empty and press Enter when you're done.",
       default, okLabel, "Cancel")
     if btn ~= okLabel then return end
@@ -896,7 +1101,7 @@ function M.plan(date)
       local name, mins
       if h then name, mins = splitLength(rest) end
       if not h or not name or name == "" then
-        hs.alert.show('Couldn\'t read that. Try "10:30am CS160 PRD 45m".', 3)
+        hs.alert.show('Couldn\'t read that. Try "4pm Study GRE 3h".', 3)
       else
         if not mins then
           local b2, len = hs.dialog.textPrompt("How long for: " .. name .. "?",
@@ -907,7 +1112,7 @@ function M.plan(date)
         local o = old[name] or {}
         local same = (o.due == due and o.minutes == mins)
         table.insert(new, { name = name, due = due, minutes = mins, step = o.step or "",
-          state = o.state or "pending", startedAt = o.startedAt,
+          state = o.state or "pending", startedAt = o.startedAt, checkAt = o.checkAt,
           snoozes = o.snoozes or 0, reasons = o.reasons or {},
           warned = same and (o.warned or false) or false,
           synced = same and (o.synced or false) or false })
@@ -938,23 +1143,28 @@ function M.planDay(date)
 end
 
 -- ---------- screens ----------
+local function clockLine(size, y, h)
+  return { text = fmtTime(os.time()), font = "clock", size = size, y = y, h = h, key = "clock" }
+end
+
 function M.showTask(idx)
   local d = dayOf(loadStore(), today())
   local t = d.tasks[idx]
   if not t or t.state ~= "pending" then return end
   local lines = {
-    { text = fmtTime(os.time()), size = 120, y = 8, h = 18 },
-    { text = string.format("TASK %d OF %d   |   %s   |   %s", idx, #d.tasks, fmtTime(t.due),
-        fmtLen(t.minutes or M.defaultMinutes)), size = 24, color = DIM, y = 30, h = 5 },
-    { text = t.name, size = 64, y = 38, h = 22 },
+    clockLine(124, 7, 17),
+    { text = string.format("TASK %d OF %d    ·    %s    ·    %s", idx, #d.tasks, fmtTime(t.due),
+        fmtLen(t.minutes or M.defaultMinutes)), font = "small", size = 17, color = T.faint, y = 27, h = 4 },
+    { text = t.name, key = "name", font = "title", size = 60, y = 33, h = 24 },
   }
   if (t.snoozes or 0) > 0 then
-    table.insert(lines, { text = "Pushed " .. t.snoozes .. "x already.", size = 24, color = DIM, y = 64, h = 6 })
+    table.insert(lines, { text = "pushed " .. t.snoozes .. "x already", font = "small", size = 20,
+      color = T.dim, y = 61, h = 5 })
   end
   showOverlay("task", lines, {
-    { label = "Start  [Enter]", keys = { "return" }, primary = true,
+    { label = "Start", keys = { "return" }, primary = true,
       fn = function() thenPrompt(function() promptFirstStep(idx, false) end, "First step for: " .. t.name) end },
-    { label = "Not now  [S]", keys = { "s" }, fn = function() M.showNotNow(idx) end },
+    { label = "Not now", keys = { "s" }, fn = function() M.showNotNow(idx) end },
   })
 end
 
@@ -966,34 +1176,34 @@ function M.showNotNow(idx)
   local maxed = pushed >= M.maxSnoozes
   local sub = ""
   if maxed then sub = "Start it, move it to tomorrow, or drop it."
-  elseif pushed > 0 then sub = "Pushed " .. pushed .. "x today." end
+  elseif pushed > 0 then sub = "pushed " .. pushed .. "x today" end
 
   local lines = {
-    { text = fmtTime(os.time()), size = 90, y = 6, h = 14 },
+    clockLine(88, 5, 13),
     { text = maxed and ("Pushed " .. pushed .. " times already.") or "Can't right now, or don't want to?",
-      size = 44, color = YELLOW, y = 22, h = 14 },
-    { text = randomTip(M.startTips), size = 30, y = 38, h = 22 },
-    { text = sub, size = 24, color = DIM, y = 62, h = 6 },
-    { text = "", key = "wait", size = 20, color = DIM, y = 70, h = 5 },
+      key = "question", font = "title", size = 40, color = T.accent, y = 21, h = 12 },
+    { text = "“" .. randomTip(M.startTips) .. "”", key = "tip", font = "body", size = 29, y = 36, h = 21 },
+    { text = sub, font = "small", size = 20, color = T.dim, y = 60, h = 5 },
+    { text = "", key = "wait", font = "small", size = 17, color = T.faint, y = 69, h = 4 },
   }
   local buttons = {
-    { label = "Just 2 min  [Enter]", keys = { "return" }, primary = true,
+    { label = "Just 2 min", keys = { "return" }, primary = true,
       fn = function() thenPrompt(function() promptFirstStep(idx, true) end, "Just 2 minutes: " .. t.name) end },
   }
   if maxed then
-    table.insert(buttons, { label = "Tomorrow  [T]", keys = { "t" },
+    table.insert(buttons, { label = "Tomorrow", keys = { "t" },
       fn = function()
         thenPrompt(function() promptMove(today(), idx, function() M.showNotNow(idx) end) end,
           "Move to tomorrow: " .. t.name)
       end })
-    table.insert(buttons, { label = "Drop it  [X]", keys = { "x" },
+    table.insert(buttons, { label = "Drop it", keys = { "x" },
       fn = function()
         setState(today(), idx, "dropped")
         closeOverlay()
         hs.alert.show("Dropped: " .. t.name, 3)
       end })
   else
-    table.insert(buttons, { label = "Busy / out  [B]", keys = { "b" },
+    table.insert(buttons, { label = "Busy / out", keys = { "b" },
       fn = function() thenPrompt(function() promptReason(idx) end, "Why not now: " .. t.name) end })
   end
   table.insert(buttons, { hidden = true, keys = { "escape" }, fn = function() M.showTask(idx) end })
@@ -1007,21 +1217,21 @@ function M.showSnoozePick(idx)
   local t = d.tasks[idx]
   if not t then return end
   local lines = {
-    { text = fmtTime(os.time()), size = 110, y = 8, h = 17 },
-    { text = "Push it how long?", size = 52, color = YELLOW, y = 30, h = 12 },
-    { text = t.name, size = 32, y = 44, h = 10 },
-    { text = "Reason: " .. (M.pendingReason or ""), size = 24, color = DIM, y = 58, h = 8 },
-    { text = "Esc = back", size = 18, color = DIM, y = 70, h = 5 },
+    clockLine(110, 7, 17),
+    { text = "Push it how long?", font = "title", size = 48, color = T.accent, y = 29, h = 11 },
+    { text = t.name, key = "name", font = "body", size = 32, y = 42, h = 10 },
+    { text = "reason: " .. (M.pendingReason or ""), font = "small", size = 20, color = T.dim, y = 57, h = 6 },
+    { text = "esc = back", font = "small", size = 17, color = T.faint, y = 69, h = 4 },
   }
   local buttons = {}
   for k, mins in ipairs(M.snoozes) do
-    table.insert(buttons, { label = string.format("%s  [%d]", snoozeLabel(mins), k), keys = { tostring(k) },
+    table.insert(buttons, { label = snoozeLabel(mins), keys = { tostring(k) },
       fn = function() snooze(idx, mins, M.pendingReason) end })
   end
   local ck = #M.snoozes + 1
-  table.insert(buttons, { label = string.format("Custom  [%d]", ck), keys = { tostring(ck) },
+  table.insert(buttons, { label = "Custom", keys = { tostring(ck) },
     fn = function() thenPrompt(function() promptSnooze(idx) end, "Push: " .. t.name) end })
-  table.insert(buttons, { label = "Tomorrow  [T]", keys = { "t" },
+  table.insert(buttons, { label = "Tomorrow", keys = { "t" },
     fn = function()
       thenPrompt(function() promptMove(today(), idx, function() M.showSnoozePick(idx) end) end,
         "Move to tomorrow: " .. t.name)
@@ -1030,50 +1240,99 @@ function M.showSnoozePick(idx)
   showOverlay("snooze", lines, buttons)
 end
 
+-- the planned length is up: done / still going / next step
+function M.showBlockEnd(idx)
+  local d = dayOf(loadStore(), today())
+  local t = d.tasks[idx]
+  if not t or t.state ~= "started" then return end
+  local started = t.startedAt or t.due
+  local lines = {
+    clockLine(120, 6, 17),
+    { text = string.format("BLOCK UP    ·    planned %s    ·    started %s",
+        fmtLen(t.minutes or M.defaultMinutes), fmtTime(started)),
+      font = "small", size = 17, color = T.faint, y = 25, h = 4 },
+    { text = t.name, key = "name", font = "title", size = 56, y = 31, h = 18 },
+    { text = ((t.step or "") ~= "") and ("last step:  " .. t.step) or "", font = "small", size = 20,
+      color = T.dim, y = 51, h = 6 },
+    { text = "How's it going?", key = "question", font = "body", size = 32, color = T.accent, y = 60, h = 8 },
+  }
+  showOverlay("blockend", lines, {
+    { label = "Done", keys = { "d" }, primary = true, fn = function() finishTask(today(), idx) end },
+    { label = "Still going", keys = { "g" }, fn = function() extendBlock(idx) end },
+    { label = "Next step", keys = { "n" },
+      fn = function() thenPrompt(function() promptNextStep(idx) end, "Next step for: " .. t.name) end },
+  })
+end
+
+-- reward screen: pics fill the screen
+function M.celebrate(date, idx)
+  local d = dayOf(loadStore(), date)
+  local t = d.tasks[idx]
+  if not t then return end
+  local spent = t.startedAt and fmtDur((t.doneAt or os.time()) - t.startedAt) or nil
+  local ni = (date == today()) and nextIndex(d) or nil
+  local lines = {
+    { text = "✓   DONE", font = "title", size = 24, color = T.accent, y = 12, h = 5 },
+    { text = t.name, key = "name", font = "title", size = 46, y = 19, h = 20 },
+    { text = spent and (spent .. " of focus") or "", key = "spent", font = "body", size = 24, color = T.dim, y = 41, h = 5 },
+    { text = string.format("%d of %d done today", doneCount(d), #d.tasks), key = "count", font = "small",
+      size = 19, color = T.dim, y = 47, h = 4 },
+    { text = randomTip(M.celebrateLines), key = "cheer", font = "body", size = 30, color = T.accent, y = 54, h = 13 },
+    { text = ni and ("up next:  " .. d.tasks[ni].name .. "  at  " .. fmtTime(d.tasks[ni].due)) or "",
+      font = "small", size = 18, color = T.faint, y = 69, h = 7 },
+  }
+  showOverlay("celebrate", lines, {
+    { label = "Keep going", keys = { "return", "escape" }, primary = true, fn = closeOverlay },
+  }, { layout = "gallery" })
+  playSound(M.celebrateSound)
+end
+
 function M.showCheckin()
   local d = dayOf(loadStore(), today())
   local ai = activeIndex(d)
-  local lines = { { text = fmtTime(os.time()), size = 150, y = 8, h = 22 } }
+  local lines = { clockLine(150, 7, 22) }
   local buttons = {
-    { label = "Close  [Enter]", keys = { "return", "escape" }, primary = true, fn = closeOverlay },
+    { label = "Close", keys = { "return", "escape" }, primary = true, fn = closeOverlay },
   }
 
   if ai then
     local t = d.tasks[ai]
-    table.insert(lines, { text = "NOW:  " .. t.name, size = 36, color = DIM, y = 34, h = 8 })
-    table.insert(lines, { text = "NEXT STEP:  " .. ((t.step ~= "" and t.step) or "?"),
-      size = 50, color = YELLOW, y = 43, h = 18 })
-    table.insert(buttons, { label = "Edit step  [E]", keys = { "e" },
+    table.insert(lines, { text = "NOW    ·    " .. t.name:upper(), font = "small", size = 20, color = T.faint, y = 33, h = 5 })
+    table.insert(lines, { text = ((t.step ~= "" and t.step) or "?"), key = "step",
+      font = "title", size = 48, color = T.accent, y = 40, h = 18 })
+    table.insert(buttons, { label = "Edit step", keys = { "e" },
       fn = function() thenPrompt(editStep, "Next step for: " .. t.name) end })
-    table.insert(buttons, { label = "Done  [D]", keys = { "d" }, fn = markDone })
+    table.insert(buttons, { label = "Done", keys = { "d" }, fn = markDone })
   else
     local ni = nextIndex(d)
     if ni then
       local t = d.tasks[ni]
-      table.insert(lines, { text = "NEXT:  " .. t.name, size = 50, color = YELLOW, y = 36, h = 14 })
-      table.insert(lines, { text = string.format("at %s  (in %s)", fmtTime(t.due),
-        fmtDur(t.due - os.time())), size = 30, color = DIM, y = 51, h = 7 })
+      table.insert(lines, { text = "NEXT", font = "small", size = 20, color = T.faint, y = 33, h = 5 })
+      table.insert(lines, { text = t.name, key = "step", font = "title", size = 48, color = T.accent, y = 39, h = 12 })
+      table.insert(lines, { text = string.format("at %s   ·   in %s", fmtTime(t.due),
+        fmtDur(t.due - os.time())), font = "body", size = 26, color = T.dim, y = 52, h = 6 })
     else
       local msg = (#d.tasks == 0) and "No plan for today" or "Nothing left for today"
-      table.insert(lines, { text = msg, size = 46, color = DIM, y = 40, h = 12 })
+      table.insert(lines, { text = msg, font = "body", size = 42, color = T.dim, y = 40, h = 12 })
     end
-    table.insert(buttons, { label = "Plan day  [N]", keys = { "n" }, fn = function() M.planDay(today()) end })
+    table.insert(buttons, { label = "Plan day", keys = { "n" }, fn = function() M.planDay(today()) end })
   end
 
   if #d.tasks > 0 then
-    table.insert(lines, { text = taskListText(d), size = 18, color = { white = 0.55 }, y = 62, h = 16 })
+    table.insert(lines, { text = taskListText(d), key = "list", font = "small", size = 18, color = T.dim, y = 61, h = 17 })
   end
   showOverlay("checkin", lines, buttons)
 end
 
 function M.showPlanPrompt()
   showOverlay("plan", {
-    { text = fmtTime(os.time()), size = 120, y = 10, h = 18 },
-    { text = "Plan today's tasks", size = 64, color = YELLOW, y = 38, h = 14 },
-    { text = "Up to " .. M.maxTasks .. ", each with a time and a length.", size = 28, color = DIM, y = 54, h = 6 },
+    clockLine(124, 9, 18),
+    { text = "Plan today's tasks", font = "title", size = 58, color = T.accent, y = 36, h = 13 },
+    { text = "Up to " .. M.maxTasks .. ", each with a time and a length.", font = "body", size = 26,
+      color = T.dim, y = 51, h = 6 },
   }, {
-    { label = "Plan now  [Enter]", keys = { "return" }, primary = true, fn = function() M.planDay(today()) end },
-    { label = "Later  [Esc]", keys = { "escape" }, fn = closeOverlay },
+    { label = "Plan now", keys = { "return" }, primary = true, fn = function() M.planDay(today()) end },
+    { label = "Later", keys = { "escape" }, fn = closeOverlay },
   })
 end
 
@@ -1087,17 +1346,18 @@ function M.showMorning()
 
   local has = #d.tasks > 0
   local lines = {
-    { text = fmtTime(os.time()), size = 110, y = 4, h = 16 },
-    { text = prettyDate(td), size = 26, color = DIM, y = 20, h = 5 },
-    { text = randomTip(M.morningTips), size = 26, color = YELLOW, y = 26, h = 9 },
-    { text = has and taskListText(d, "TODAY'S PLAN") or "No plan yet.",
-      size = has and 22 or 40, y = 37, h = 20 },
-    { text = "", key = "agenda", size = 18, color = DIM, y = 58, h = 20 },
+    clockLine(112, 3, 16),
+    { text = prettyDate(td):upper(), font = "small", size = 18, color = T.faint, y = 19.5, h = 4 },
+    { text = "“" .. randomTip(M.morningTips) .. "”", key = "tip", font = "body", size = 26,
+      color = T.accent, y = 25, h = 9 },
+    { text = has and taskListText(d, "TODAY") or "No plan yet.", key = "plan",
+      font = has and "body" or "title", size = has and 21 or 40, y = 36, h = 21 },
+    { text = "", key = "agenda", font = "small", size = 17, color = T.dim, y = 58, h = 20 },
   }
   local buttons
   if has then
     buttons = {
-      { label = "Let's go  [Enter]", keys = { "return" }, primary = true, fn = function()
+      { label = "Let's go", keys = { "return" }, primary = true, fn = function()
           local s2 = loadStore()
           dayOf(s2, td).confirmed = true
           saveStore(s2)
@@ -1108,15 +1368,15 @@ function M.showMorning()
             or "Plan locked in.", 4)
           syncStructured(td)
         end },
-      { label = "Edit plan  [E]", keys = { "e" }, fn = function() M.planDay(td) end },
+      { label = "Edit plan", keys = { "e" }, fn = function() M.planDay(td) end },
     }
   else
     buttons = {
-      { label = "Plan today  [Enter]", keys = { "return" }, primary = true, fn = function() M.planDay(td) end },
-      { label = "Later  [Esc]", keys = { "escape" }, fn = closeOverlay },
+      { label = "Plan today", keys = { "return" }, primary = true, fn = function() M.planDay(td) end },
+      { label = "Later", keys = { "escape" }, fn = closeOverlay },
     }
   end
-  showOverlay("morning", lines, buttons, { collage = true })
+  showOverlay("morning", lines, buttons, { layout = "collage" })
   loadAgendaInto("agenda", td, "Today")
 end
 
@@ -1125,31 +1385,31 @@ function M.showReviewIntro(date, missed)
   local d = dayOf(loadStore(), date)
   local open = openCount(d)
   local nextDate = dateAdd(date, 1)
-  local summary = (#d.tasks == 0) and "No tasks were planned."
+  local summary = (#d.tasks == 0) and "no tasks were planned"
     or string.format("%d of %d done", doneCount(d), #d.tasks)
   local lines = {
-    { text = fmtTime(os.time()), size = 110, y = 4, h = 16 },
+    clockLine(112, 3, 16),
     { text = (missed and "You didn't close out " or "Close out ") .. prettyDate(date),
-      size = 34, color = YELLOW, y = 21, h = 7 },
-    { text = summary, size = 26, color = DIM, y = 28, h = 5 },
-    { text = taskListText(d), size = 22, y = 34, h = 22 },
-    { text = "", key = "agenda", size = 18, color = DIM, y = 57, h = 21 },
+      key = "title", font = "title", size = 32, color = T.accent, y = 20, h = 7 },
+    { text = summary, font = "small", size = 20, color = T.dim, y = 27, h = 5 },
+    { text = taskListText(d), key = "list", font = "body", size = 21, y = 34, h = 22 },
+    { text = "", key = "agenda", font = "small", size = 17, color = T.dim, y = 57, h = 21 },
   }
   local buttons = {}
   if open > 0 then
-    table.insert(buttons, { label = "Review " .. open .. " open  [Enter]", keys = { "return" }, primary = true,
+    table.insert(buttons, { label = "Review " .. open .. " open", keys = { "return" }, primary = true,
       fn = function() M.reviewNext(date, missed) end })
   else
-    table.insert(buttons, { label = "Done  [Enter]", keys = { "return" }, primary = true,
+    table.insert(buttons, { label = "Done", keys = { "return" }, primary = true,
       fn = function() finishReview(date) end })
     if not missed then
-      table.insert(buttons, { label = "Plan tomorrow  [N]", keys = { "n" },
+      table.insert(buttons, { label = "Plan tomorrow", keys = { "n" },
         fn = function() finishReview(date); M.planDay(nextDate) end })
     end
   end
-  table.insert(buttons, { label = "Later  [Esc]", keys = { "escape" },
+  table.insert(buttons, { label = "Later", keys = { "escape" },
     fn = function() M.reviewSnoozeUntil = os.time() + 1800; closeOverlay() end })
-  showOverlay("review", lines, buttons, { collage = true })
+  showOverlay("review", lines, buttons, { layout = "collage" })
   if not missed then loadAgendaInto("agenda", nextDate, "Tomorrow") else M.setLine("agenda", "") end
 end
 
@@ -1169,22 +1429,22 @@ function M.showReviewTask(date, idx, missed)
   local t = d.tasks[idx]
   if not t then M.reviewNext(date, missed) return end
   local status = (t.state == "started")
-    and ("Started at " .. fmtTime(t.startedAt or t.due) .. (((t.step or "") ~= "") and ("   |   step: " .. t.step) or ""))
-    or "Not started"
-  if (t.snoozes or 0) > 0 then status = status .. "   |   pushed " .. t.snoozes .. "x" end
+    and ("started at " .. fmtTime(t.startedAt or t.due) .. (((t.step or "") ~= "") and ("    ·    step: " .. t.step) or ""))
+    or "not started"
+  if (t.snoozes or 0) > 0 then status = status .. "    ·    pushed " .. t.snoozes .. "x" end
   local reasons = (type(t.reasons) == "table" and #t.reasons > 0)
-    and ("Why: " .. table.concat(t.reasons, ", ")) or ""
+    and ("why: " .. table.concat(t.reasons, ", ")) or ""
 
   showOverlay("review", {
-    { text = fmtTime(os.time()), size = 100, y = 6, h = 15 },
-    { text = "Did it happen?", size = 44, color = YELLOW, y = 24, h = 10 },
-    { text = t.name, size = 52, y = 36, h = 16 },
-    { text = status, size = 22, color = DIM, y = 54, h = 6 },
-    { text = reasons, size = 20, color = DIM, y = 61, h = 8 },
+    clockLine(104, 5, 15),
+    { text = "Did it happen?", font = "title", size = 40, color = T.accent, y = 23, h = 9 },
+    { text = t.name, key = "name", font = "title", size = 50, y = 34, h = 16 },
+    { text = status, font = "small", size = 20, color = T.dim, y = 52, h = 6 },
+    { text = reasons, font = "small", size = 18, color = T.faint, y = 59, h = 8 },
   }, {
-    { label = "Done  [D]", keys = { "d" }, primary = true,
+    { label = "Done", keys = { "d" }, primary = true,
       fn = function() setState(date, idx, "done"); M.reviewNext(date, missed) end },
-    { label = "Tomorrow  [T]", keys = { "t" },
+    { label = "Tomorrow", keys = { "t" },
       fn = function()
         thenPrompt(function()
           promptMove(date, idx,
@@ -1192,28 +1452,29 @@ function M.showReviewTask(date, idx, missed)
             function() M.reviewNext(date, missed) end)
         end, "Move to " .. prettyDate(dateAdd(date, 1)) .. ": " .. t.name)
       end },
-    { label = "Drop  [X]", keys = { "x" },
+    { label = "Drop", keys = { "x" },
       fn = function() setState(date, idx, "dropped"); M.reviewNext(date, missed) end },
-  }, { collage = true })
+  }, { layout = "collage" })
 end
 
 function M.showReviewEnd(date, missed)
   local d = dayOf(loadStore(), date)
   local nextDate = dateAdd(date, 1)
   local buttons = {
-    { label = "Done  [Enter]", keys = { "return", "escape" }, primary = true, fn = function() finishReview(date) end },
+    { label = "Done", keys = { "return", "escape" }, primary = true, fn = function() finishReview(date) end },
   }
   if not missed then
-    table.insert(buttons, { label = "Plan tomorrow  [N]", keys = { "n" },
+    table.insert(buttons, { label = "Plan tomorrow", keys = { "n" },
       fn = function() finishReview(date); M.planDay(nextDate) end })
   end
   showOverlay("review", {
-    { text = fmtTime(os.time()), size = 110, y = 4, h = 16 },
-    { text = "Day closed", size = 44, color = YELLOW, y = 21, h = 9 },
-    { text = string.format("%d of %d done", doneCount(d), #d.tasks), size = 26, color = DIM, y = 30, h = 5 },
-    { text = taskListText(d), size = 22, y = 36, h = 20 },
-    { text = "", key = "agenda", size = 18, color = DIM, y = 57, h = 21 },
-  }, buttons, { collage = true })
+    clockLine(112, 3, 16),
+    { text = "Day closed", key = "title", font = "title", size = 42, color = T.accent, y = 20, h = 9 },
+    { text = string.format("%d of %d done", doneCount(d), #d.tasks), font = "small", size = 20,
+      color = T.dim, y = 29, h = 5 },
+    { text = taskListText(d), key = "list", font = "body", size = 21, y = 35, h = 21 },
+    { text = "", key = "agenda", font = "small", size = 17, color = T.dim, y = 57, h = 21 },
+  }, buttons, { layout = "collage" })
   if not missed then loadAgendaInto("agenda", nextDate, "Tomorrow") end
 end
 
@@ -1285,8 +1546,15 @@ local function tick()
   if checkSpecial(s, td, now, quiet) then return end
   if quiet then return end
 
-  -- task reminders (also fires after wake if one was missed)
   if d then
+    -- block-end check-ins for tasks you started
+    for i, t in ipairs(d.tasks) do
+      if t.state == "started" and t.checkAt and now >= t.checkAt then
+        M.showBlockEnd(i)
+        return
+      end
+    end
+    -- task reminders (also fires after wake if one was missed)
     for i, t in ipairs(d.tasks) do
       if t.state == "pending" and now >= t.due then
         M.showTask(i)

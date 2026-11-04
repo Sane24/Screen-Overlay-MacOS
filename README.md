@@ -1,5 +1,5 @@
 # Screen-Overlay-MacOS
-A full screen overlay for meeting reminders and work blocks scheduling, designed for ADHD users, with aesthetic customization to add moodboards/images and text for motivation..
+A full screen overlay for meeting reminders and work blocks scheduling, designed for ADHD users and general memory and time blindness support, with aesthetic customization to add moodboards, images and text for motivation and memory.
 
 Setup Instructions:
 Run brew install --cask hammerspoon, open it, and allow what it asks for.

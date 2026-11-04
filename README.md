@@ -10,3 +10,5 @@ Terminal command: mkdir -p ~/.hammerspoon && mv -i ~/Downloads/init.lua ~/.hamme
 Click the hammer icon in the menu bar → Reload Config.
 Press ⌃⌥⌘N to set your task and step, then ⌃⌥⌘T to test.
 
+For future updates, redownload the lua file and run:
+mv ~/Downloads/init.lua ~/.hammerspoon/init.lua && killall Hammerspoon; sleep 1; open -a Hammerspoon

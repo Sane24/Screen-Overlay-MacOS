@@ -188,7 +188,7 @@ local function reviewTime(date)
 end
 
 local function nextMorning()
-  local d = os.date("*t")
+  local d = os.date("*t", os.time())
   local t = os.time({ year = d.year, month = d.month, day = d.day, hour = M.morningHour, min = 0, sec = 0 })
   if t <= os.time() then t = t + 24 * 3600 end
   return t
